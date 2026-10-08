@@ -2,6 +2,7 @@ module.exports = {
   apps: [
     {
       name: 'telegram-crawler-sheets',
+      cwd: __dirname,
       script: './dist/index.js',
       instances: 1,
       autorestart: true,
@@ -10,7 +11,6 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
       },
-      env_file: '.env',
       time: true,
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       error_file: './logs/pm2-error.log',

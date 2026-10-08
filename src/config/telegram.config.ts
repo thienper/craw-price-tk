@@ -12,7 +12,7 @@ export const IGNORED_BUTTON_PATTERNS: RegExp[] = [
   /(api key|tạo key|thu hồi|revoke)/i,
   /(ngôn ngữ|language|tiếng việt|english|chinese|russian)/i,
   /(mua ngay|đặt mua|mua|buy|order|thanh toán|payment|checkout)/i,
-  /(hủy|cancel|close|đóng|thoát|exit|xong|done)/i,
+  /(hủy|cancel|close|đóng|thoát|\bexit\b|xong|done)/i,
   /^[+\-–—]$/,
   /(xác nhận|confirm|chấp nhận|đồng ý)/i,
   /(hỗ trợ|support|admin|liên hệ|contact)/i,

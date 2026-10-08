@@ -4,23 +4,11 @@ import { validateGoogleConfig } from '../config/env.js';
 import {
   GOOGLE_SHEET_NAMES,
   PRODUCTS_SHEET_HEADERS,
-  PRICE_HISTORY_SHEET_HEADERS,
   SYNC_LOGS_SHEET_HEADERS,
 } from '../config/google.config.js';
 import { Product } from '../products/product.types.js';
-import { formatVietnamTime } from '../utils/date.js';
 import { retryWithBackoff } from '../utils/retry.js';
 import { logger } from '../utils/logger.js';
-
-export interface PriceHistoryRecord {
-  productId: string;
-  productName: string;
-  category: string;
-  oldPrice: number;
-  newPrice: number;
-  difference: number;
-  changedAt: string;
-}
 
 export interface SyncLogRecord {
   syncId: string;
@@ -45,10 +33,10 @@ export interface SheetsSyncResult {
 }
 
 interface ExistingProductCache {
-  rowIndex: number;
-  row: string[];
   price: number;
   stock: number | null;
+  productName: string;
+  category: string;
 }
 
 export class GoogleSheetsService {
@@ -86,11 +74,22 @@ export class GoogleSheetsService {
 
         const requiredSheets: { name: string; headers: readonly string[] }[] = [
           { name: this.productsSheetName, headers: PRODUCTS_SHEET_HEADERS },
-          { name: GOOGLE_SHEET_NAMES.PRICE_HISTORY, headers: PRICE_HISTORY_SHEET_HEADERS },
           { name: GOOGLE_SHEET_NAMES.SYNC_LOGS, headers: SYNC_LOGS_SHEET_HEADERS },
         ];
 
         const requests: sheets_v4.Schema$Request[] = [];
+
+        // If PriceHistory sheet exists, delete it as requested by user
+        const priceHistorySheetId = existingSheets.get(GOOGLE_SHEET_NAMES.PRICE_HISTORY);
+        if (typeof priceHistorySheetId === 'number') {
+          logger.info(`[GoogleSheets] Deleting deprecated sheet: "${GOOGLE_SHEET_NAMES.PRICE_HISTORY}"`);
+          requests.push({
+            deleteSheet: {
+              sheetId: priceHistorySheetId,
+            },
+          });
+          existingSheets.delete(GOOGLE_SHEET_NAMES.PRICE_HISTORY);
+        }
 
         for (const sheet of requiredSheets) {
           if (!existingSheets.has(sheet.name)) {
@@ -205,7 +204,7 @@ export class GoogleSheetsService {
   }
 
   /**
-   * Loads existing products into memory cache.
+   * Loads existing products into memory cache for price comparison only.
    * Maps Column I (index 8) as ID, Column G (index 6) as Price, Column H (index 7) as Stock.
    */
   public async loadExistingCache(): Promise<void> {
@@ -220,10 +219,12 @@ export class GoogleSheetsService {
     const rows = res.data.values || [];
     this.existingProductsMap.clear();
 
-    rows.forEach((row, index) => {
+    rows.forEach((row) => {
       const id = row[8]?.toString().trim(); // Column I is hidden ID
       if (id) {
-        const price = parseInt(row[6] || '0', 10); // Column G is Giá nhập
+        const category = row[0]?.toString().trim() || '';
+        const productName = row[1]?.toString().trim() || '';
+        const price = parseInt(row[6]?.toString().replace(/[^\d]/g, '') || '0', 10);
         const stockRaw = row[7]?.toString().trim() || '';
         let stock: number | null = null;
         if (stockRaw) {
@@ -232,22 +233,22 @@ export class GoogleSheetsService {
         }
 
         this.existingProductsMap.set(id, {
-          rowIndex: index + 2,
-          row,
           price: isNaN(price) ? 0 : price,
           stock,
+          productName,
+          category,
         });
       }
     });
 
-    this.nextRowIndex = rows.length + 2;
     logger.info(
-      `[GoogleSheets] Cache loaded with ${this.existingProductsMap.size} existing product(s).`,
+      `[GoogleSheets] Cache loaded with ${this.existingProductsMap.size} existing product(s) for price comparison.`,
     );
   }
 
   /**
    * Synchronizes a batch of products from one category directly into Google Sheets in real-time.
+   * Products are written strictly contiguously starting at this.nextRowIndex to prevent any blank gaps.
    */
   public async syncCategoryProducts(products: Product[]): Promise<{
     added: number;
@@ -259,126 +260,63 @@ export class GoogleSheetsService {
       return { added: 0, updated: 0, unchanged: 0, priceChanges: 0 };
     }
 
-    const nowFormatted = formatVietnamTime();
-    const newRowsToAppend: string[][] = [];
-    const batchUpdateData: sheets_v4.Schema$ValueRange[] = [];
-    const priceHistoryEntries: PriceHistoryRecord[] = [];
-
+    const rowsToWrite: string[][] = [];
     let added = 0;
     let updated = 0;
     let unchanged = 0;
+    let priceChanges = 0;
 
     for (const product of products) {
       const existing = this.existingProductsMap.get(product.id);
 
       if (!existing) {
-        const row = this.productToRow(product);
-        newRowsToAppend.push(row);
-
-        this.existingProductsMap.set(product.id, {
-          rowIndex: this.nextRowIndex++,
-          row,
-          price: product.price,
-          stock: product.stock !== undefined ? product.stock : null,
-        });
-
         added++;
       } else {
         const priceChanged = existing.price !== product.price;
         const stockChanged = existing.stock !== product.stock;
 
         if (priceChanged) {
-          const diff = product.price - existing.price;
-          priceHistoryEntries.push({
-            productId: product.id,
-            productName: product.productName,
-            category: product.category,
-            oldPrice: existing.price,
-            newPrice: product.price,
-            difference: diff,
-            changedAt: nowFormatted,
-          });
-        }
-
-        if (priceChanged || stockChanged) {
-          const updatedRow = this.productToRow(product);
-
-          batchUpdateData.push({
-            range: `${this.productsSheetName}!A${existing.rowIndex}:I${existing.rowIndex}`,
-            values: [updatedRow],
-          });
-
-          existing.price = product.price;
-          existing.stock = product.stock !== undefined ? product.stock : null;
-          existing.row = updatedRow;
-
+          priceChanges++;
+          updated++;
+        } else if (stockChanged) {
           updated++;
         } else {
           unchanged++;
         }
       }
+
+      rowsToWrite.push(this.productToRow(product));
     }
 
-    if (batchUpdateData.length > 0) {
-      await this.sheets.spreadsheets.values.batchUpdate({
-        spreadsheetId: this.spreadsheetId,
-        requestBody: {
-          valueInputOption: 'USER_ENTERED',
-          data: batchUpdateData,
-        },
-      });
-    }
+    // Deterministically write contiguously to A${startRow}:I${endRow}
+    const startRow = this.nextRowIndex;
+    const endRow = startRow + rowsToWrite.length - 1;
+    this.nextRowIndex = endRow + 1;
 
-    if (newRowsToAppend.length > 0) {
-      await this.sheets.spreadsheets.values.append({
-        spreadsheetId: this.spreadsheetId,
-        range: `${this.productsSheetName}!A2`,
-        valueInputOption: 'USER_ENTERED',
-        insertDataOption: 'INSERT_ROWS',
-        requestBody: {
-          values: newRowsToAppend,
-        },
-      });
-    }
+    await this.sheets.spreadsheets.values.update({
+      spreadsheetId: this.spreadsheetId,
+      range: `${this.productsSheetName}!A${startRow}:I${endRow}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: rowsToWrite,
+      },
+    });
 
-    if (priceHistoryEntries.length > 0) {
-      await this.recordPriceHistory(priceHistoryEntries);
-    }
-
-    return { added, updated, unchanged, priceChanges: priceHistoryEntries.length };
+    return { added, updated, unchanged, priceChanges };
   }
 
   /**
    * Finalizes the sync cycle:
-   * Sets out-of-stock products for missing items and applies vibrant formatting & category merges.
+   * Formats rows, vertically merges categories, and wipes any leftover empty formatting.
    */
   public async finalizeSync(seenProductIds: Set<string>): Promise<number> {
     logger.info('[GoogleSheets] Finalizing sync & applying beautiful styling & merges...');
 
     let deactivatedCount = 0;
-    const batchUpdateData: sheets_v4.Schema$ValueRange[] = [];
-
-    // For products in cache that were NOT seen during this full crawl, mark stock as Hết hàng
-    for (const [id, cached] of this.existingProductsMap.entries()) {
-      if (!seenProductIds.has(id) && (cached.stock === null || cached.stock > 0)) {
-        cached.stock = 0;
-        cached.row[7] = 'Hết hàng'; // Column H is Tồn kho
-        batchUpdateData.push({
-          range: `${this.productsSheetName}!H${cached.rowIndex}:H${cached.rowIndex}`,
-          values: [['Hết hàng']],
-        });
+    for (const id of this.existingProductsMap.keys()) {
+      if (!seenProductIds.has(id)) {
         deactivatedCount++;
       }
-    }
-
-    if (batchUpdateData.length > 0) {
-      await this.sheets.spreadsheets.values.batchUpdate({
-        spreadsheetId: this.spreadsheetId,
-        requestBody: {
-          valueInputOption: 'USER_ENTERED',
-          data: batchUpdateData,
-        },
-      });
     }
 
     // Apply harmonious styling, clear white backgrounds, bold red/green stock, +1 font size, and category merges
@@ -411,8 +349,32 @@ export class GoogleSheetsService {
       range: `${this.productsSheetName}!A1:I`,
     });
 
-    const rows = res.data.values || [];
+    const allRows = res.data.values || [];
+    // Filter out any blank rows so that totalRows strictly counts valid data rows
+    const validRows: string[][] = [];
+    for (let i = 0; i < allRows.length; i++) {
+      const r = allRows[i];
+      if (i === 0 || (r && r.length > 0 && r.some((c) => c && c.toString().trim() !== ''))) {
+        validRows.push(r);
+      }
+    }
+    const rows = validRows;
     const totalRows = rows.length;
+
+    // If there were stray/empty rows found, re-write cleanly and wipe below totalRows
+    if (allRows.length > totalRows) {
+      logger.info(`[GoogleSheets] Compacting table: removed ${allRows.length - totalRows} empty gap rows.`);
+      await this.sheets.spreadsheets.values.update({
+        spreadsheetId: this.spreadsheetId,
+        range: `${this.productsSheetName}!A1:I${totalRows}`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: rows },
+      });
+      await this.sheets.spreadsheets.values.clear({
+        spreadsheetId: this.spreadsheetId,
+        range: `${this.productsSheetName}!A${totalRows + 1}:Z`,
+      });
+    }
 
     const requests: sheets_v4.Schema$Request[] = [
       // 1. Freeze Header Row
@@ -821,32 +783,8 @@ export class GoogleSheetsService {
   }
 
   /**
-   * Appends price changes to PriceHistory sheet.
-   */
-  public async recordPriceHistory(entries: PriceHistoryRecord[]): Promise<void> {
-    if (entries.length === 0) return;
-
-    const values = entries.map((e) => [
-      e.productId,
-      e.productName,
-      e.category,
-      e.oldPrice,
-      e.newPrice,
-      e.difference > 0 ? `+${e.difference}` : `${e.difference}`,
-      e.changedAt,
-    ]);
-
-    await this.sheets.spreadsheets.values.append({
-      spreadsheetId: this.spreadsheetId,
-      range: `${GOOGLE_SHEET_NAMES.PRICE_HISTORY}!A2`,
-      valueInputOption: 'USER_ENTERED',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values },
-    });
-  }
-
-  /**
    * Records a sync run summary into SyncLogs sheet.
+   * Overwrites Row 2 with the single latest run so that older logs do not accumulate.
    */
   public async recordSyncLog(log: SyncLogRecord): Promise<void> {
     await this.ensureSheetsInitialized();
@@ -866,16 +804,25 @@ export class GoogleSheetsService {
     ];
 
     try {
-      await this.sheets.spreadsheets.values.append({
+      const colLetter = String.fromCharCode(64 + SYNC_LOGS_SHEET_HEADERS.length);
+
+      // 1. Overwrite Row 2 with latest log
+      await this.sheets.spreadsheets.values.update({
         spreadsheetId: this.spreadsheetId,
-        range: `${GOOGLE_SHEET_NAMES.SYNC_LOGS}!A2`,
+        range: `${GOOGLE_SHEET_NAMES.SYNC_LOGS}!A2:${colLetter}2`,
         valueInputOption: 'USER_ENTERED',
-        insertDataOption: 'INSERT_ROWS',
         requestBody: {
           values: [row],
         },
       });
-      logger.info(`[SyncLogs] Recorded run [${log.syncId}] status: ${log.status}`);
+
+      // 2. Clear any older rows below Row 2
+      await this.sheets.spreadsheets.values.clear({
+        spreadsheetId: this.spreadsheetId,
+        range: `${GOOGLE_SHEET_NAMES.SYNC_LOGS}!A3:Z`,
+      });
+
+      logger.info(`[SyncLogs] Overwritten latest run [${log.syncId}] status: ${log.status}`);
     } catch (err) {
       logger.error(`[SyncLogs] Failed to record log: ${(err as Error).message}`);
     }
